@@ -23,7 +23,7 @@ from collections import Counter, deque
 import pytchat
 import requests
 
-CHANNEL_LIVE_URL = "https://www.youtube.com/@tradeify/live"
+CHANNEL_LIVE_URL = "https://www.youtube.com/@TradeifyTV/live"
 WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "")
 
 PATROL_SECONDS = 120      # how often to check if the channel is live
