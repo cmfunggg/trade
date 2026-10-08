@@ -53,34 +53,75 @@ def notify(text: str) -> None:
         print(f"[discord] failed: {e}", flush=True)
 
 
+BOT_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)"}
+COOKIES = {"CONSENT": "YES+1", "SOCS": "CAI"}
+LIVE_SIGNALS = (
+    '"isLiveNow":true',
+    'itemprop="isLiveBroadcast" content="True"',
+    "BADGE_STYLE_TYPE_LIVE_NOW",
+)
+
+
+def fetch(url, headers):
+    return requests.get(url, headers=headers, cookies=COOKIES, timeout=15)
+
+
+def page_title(html: str) -> str:
+    m = re.search(r"<title>(.*?)</title>", html, re.S)
+    return (m.group(1).strip() if m else "")[:60]
+
+
+def video_id_from_head(html: str):
+    """Find a watch/embed video id inside <meta>/<link> tags only (not the whole page)."""
+    for tag in re.findall(r"<(?:meta|link)\b[^>]*>", html[:300000]):
+        if re.search(r'og:url|og:video|twitter:player|rel="canonical"|itemprop="url"', tag):
+            m = re.search(r"(?:watch\?v=|/embed/)([\w-]{11})", tag)
+            if m:
+                return m.group(1)
+    return None
+
+
 def check_live():
-    """Return (video_id or None, diagnostic string)."""
+    """Return (video_id or None, multi-line diagnostic string)."""
     info = []
+    vid = None
+
+    # Step 1: does the channel's /live URL resolve to a video? Try as a browser, then as a link-preview bot.
+    for label, hdrs in (("browser", HEADERS), ("bot", BOT_HEADERS)):
+        try:
+            r = fetch(CHANNEL_LIVE_URL, hdrs)
+        except requests.RequestException as e:
+            info.append(f"{label}: request failed: {e}")
+            continue
+        html = r.text
+        m = re.search(r"[?&]v=([\w-]{11})", r.url)
+        cand = m.group(1) if m else video_id_from_head(html)
+        info.append(f"{label}: HTTP {r.status_code}, size {len(html)}, id={cand}, title={page_title(html)!r}")
+        if cand:
+            vid = cand
+            break
+
+    if not vid:
+        return None, "\n".join(info + ["result: /live did not resolve to a video"])
+
+    # Step 2: confirm the video is actually live now.
     try:
-        r = requests.get(
-            CHANNEL_LIVE_URL,
-            headers=HEADERS,
-            cookies={"CONSENT": "YES+1", "SOCS": "CAI"},
-            timeout=15,
-        )
+        r = fetch(f"https://www.youtube.com/watch?v={vid}", HEADERS)
+        html = r.text
     except requests.RequestException as e:
-        return None, f"request failed: {e}"
+        info.append(f"watch page request failed: {e}")
+        return vid, "\n".join(info + ["result: assumed LIVE (could not confirm)"])
 
-    html = r.text
-    info.append(f"HTTP {r.status_code}")
-    info.append(f"final URL: {r.url}")
-    info.append(f"page size: {len(html)}")
-    if "consent.youtube.com" in r.url:
-        info.append("WARNING: landed on YouTube consent page")
+    confirmed = any(sig in html for sig in LIVE_SIGNALS)
+    ended = 'itemprop="endDate"' in html
+    upcoming = '"isUpcoming":true' in html
+    info.append(f"watch page: confirmed_live={confirmed}, ended={ended}, upcoming={upcoming}")
 
-    m = re.search(r"[?&]v=([\w-]{11})", r.url)
-    if not m:
-        m = re.search(r'<link rel="canonical" href="https://www\.youtube\.com/watch\?v=([\w-]{11})"', html)
-    vid = m.group(1) if m else None
-    is_live = '"isLiveNow":true' in html
-    info.append(f"video id: {vid}")
-    info.append(f"isLiveNow: {is_live}")
-    return (vid if (vid and is_live) else None), " | ".join(info)
+    if confirmed:
+        return vid, "\n".join(info + ["result: LIVE (confirmed)"])
+    if ended or upcoming:
+        return None, "\n".join(info + ["result: video is not live right now"])
+    return vid, "\n".join(info + ["result: assumed LIVE (unconfirmed)"])
 
 
 def normalize(msg: str) -> str:
@@ -124,7 +165,7 @@ def main_oneshot() -> None:
     print(f"Discord webhook configured: {bool(WEBHOOK)}", flush=True)
     # Manual runs ("Run workflow" button) always report to Discord, so you can test.
     if os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch":
-        notify(f"Manual check: {'LIVE' if vid else 'not live'}\n{info}")
+        notify(f"Manual check: {'LIVE' if vid else 'not live'}\n```\n{info[:1500]}\n```")
     if not vid:
         print("Not live. Exiting.", flush=True)
         return
