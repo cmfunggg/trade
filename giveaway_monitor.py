@@ -53,8 +53,9 @@ def notify(text: str) -> None:
         print(f"[discord] failed: {e}", flush=True)
 
 
-def get_live_video_id():
-    """Return the video id if the channel is live right now, else None."""
+def check_live():
+    """Return (video_id or None, diagnostic string)."""
+    info = []
     try:
         r = requests.get(
             CHANNEL_LIVE_URL,
@@ -63,15 +64,23 @@ def get_live_video_id():
             timeout=15,
         )
     except requests.RequestException as e:
-        print(f"[patrol] request failed: {e}", flush=True)
-        return None
+        return None, f"request failed: {e}"
 
     html = r.text
-    canonical = re.search(r'<link rel="canonical" href="https://www\.youtube\.com/watch\?v=([\w-]{11})"', html)
+    info.append(f"HTTP {r.status_code}")
+    info.append(f"final URL: {r.url}")
+    info.append(f"page size: {len(html)}")
+    if "consent.youtube.com" in r.url:
+        info.append("WARNING: landed on YouTube consent page")
+
+    m = re.search(r"[?&]v=([\w-]{11})", r.url)
+    if not m:
+        m = re.search(r'<link rel="canonical" href="https://www\.youtube\.com/watch\?v=([\w-]{11})"', html)
+    vid = m.group(1) if m else None
     is_live = '"isLiveNow":true' in html
-    if canonical and is_live:
-        return canonical.group(1)
-    return None
+    info.append(f"video id: {vid}")
+    info.append(f"isLiveNow: {is_live}")
+    return (vid if (vid and is_live) else None), " | ".join(info)
 
 
 def normalize(msg: str) -> str:
@@ -110,7 +119,12 @@ def sniper(video_id: str) -> None:
 
 def main_oneshot() -> None:
     """For GitHub Actions: the cron schedule is the patrol loop."""
-    vid = get_live_video_id()
+    vid, info = check_live()
+    print(info, flush=True)
+    print(f"Discord webhook configured: {bool(WEBHOOK)}", flush=True)
+    # Manual runs ("Run workflow" button) always report to Discord, so you can test.
+    if os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch":
+        notify(f"Manual check: {'LIVE' if vid else 'not live'}\n{info}")
     if not vid:
         print("Not live. Exiting.", flush=True)
         return
@@ -127,7 +141,8 @@ def main() -> None:
     last_heartbeat = time.time()
 
     while True:
-        vid = get_live_video_id()
+        vid, info = check_live()
+        print(info, flush=True)
         if vid:
             try:
                 sniper(vid)
