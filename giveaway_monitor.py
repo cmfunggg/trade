@@ -15,12 +15,12 @@ Run it under systemd / tmux / Docker on an always-on machine, OR set ONESHOT=1 a
 let a GitHub Actions cron (giveaway.yml) call it every ~5 minutes.
 """
 
+import json
 import os
 import re
 import time
 from collections import Counter, deque
 
-import pytchat
 import requests
 
 CHANNEL_LIVE_URL = "https://www.youtube.com/@TradeifyTV/live"
@@ -128,23 +128,158 @@ def normalize(msg: str) -> str:
     return re.sub(r"\s+", " ", msg.strip().lower())
 
 
+class ChatEnded(Exception):
+    pass
+
+
+def runs_to_text(runs) -> str:
+    parts = []
+    for run in runs:
+        if "text" in run:
+            parts.append(run["text"])
+        elif "emoji" in run:
+            e = run["emoji"]
+            parts.append((e.get("shortcuts") or [e.get("emojiId", "")])[0])
+    return "".join(parts)
+
+
+def parse_chat_page(html: str):
+    """Pull (api_key, client_version, first_continuation_token) out of the live_chat popout page."""
+    key = re.search(r'"INNERTUBE_API_KEY":"([^"]+)"', html)
+    ver = re.search(r'"INNERTUBE_CLIENT_VERSION":"([^"]+)"', html)
+    idx = html.find("ytInitialData")
+    if not (key and ver) or idx < 0:
+        raise RuntimeError(f"chat page unusable (size {len(html)}, key={bool(key)}, data={idx >= 0})")
+    data, _ = json.JSONDecoder().raw_decode(html[html.index("{", idx):])
+    renderer = data["contents"]["liveChatRenderer"]
+    token = None
+    try:  # prefer "Live chat" (all messages) over "Top chat" (filtered)
+        items = renderer["header"]["liveChatHeaderRenderer"]["viewSelector"]["sortFilterSubMenuRenderer"]["subMenuItems"]
+        for it in items:
+            if it.get("title", "").lower().startswith("live chat"):
+                token = it["continuation"]["reloadContinuationData"]["continuation"]
+    except (KeyError, TypeError):
+        token = None
+    if token is None:
+        cont = renderer["continuations"][0]
+        token = next(v["continuation"] for v in cont.values() if isinstance(v, dict) and "continuation" in v)
+    return key.group(1), ver.group(1), token
+
+
+def parse_chat_response(payload: dict):
+    """Return (messages, next_token). Raises ChatEnded when the chat is over."""
+    lcc = payload.get("continuationContents", {}).get("liveChatContinuation")
+    if not lcc:
+        raise ChatEnded()
+    conts = lcc.get("continuations") or []
+    nxt = next((v for v in (conts[0].values() if conts else []) if isinstance(v, dict) and "continuation" in v), None)
+    if not nxt:
+        raise ChatEnded()
+    messages = []
+    for action in lcc.get("actions", []):
+        item = action.get("addChatItemAction", {}).get("item", {})
+        msg = item.get("liveChatTextMessageRenderer")
+        if msg:
+            messages.append(runs_to_text(msg.get("message", {}).get("runs", [])))
+    return messages, nxt["continuation"]
+
+
+class ChatReader:
+    """Minimal YouTube live-chat reader that reuses our consent cookies."""
+
+    def __init__(self, video_id: str):
+        self.session = requests.Session()
+        self.session.headers.update(HEADERS)
+        self.session.cookies.update(COOKIES)
+        r = self.session.get(
+            "https://www.youtube.com/live_chat",
+            params={"is_popout": "1", "v": video_id},
+            timeout=15,
+        )
+        self.key, self.ver, self.token = parse_chat_page(r.text)
+
+    def read_new(self):
+        body = {
+            "context": {"client": {"clientName": "WEB", "clientVersion": self.ver, "hl": "en", "gl": "US"}},
+            "continuation": self.token,
+        }
+        r = self.session.post(
+            "https://www.youtube.com/youtubei/v1/live_chat/get_live_chat",
+            params={"key": self.key, "prettyPrint": "false"},
+            json=body,
+            timeout=15,
+        )
+        r.raise_for_status()
+        messages, self.token = parse_chat_response(r.json())
+        return messages
+
+
+class PytchatReader:
+    """Backup reader."""
+
+    def __init__(self, video_id: str):
+        import pytchat
+
+        self.chat = pytchat.create(video_id=video_id)
+
+    def read_new(self):
+        if not self.chat.is_alive():
+            raise ChatEnded()
+        return [c.message for c in self.chat.get().sync_items()]
+
+
+def open_reader(video_id: str):
+    try:
+        return ChatReader(video_id)
+    except Exception as e1:
+        try:
+            return PytchatReader(video_id)
+        except Exception as e2:
+            raise RuntimeError(f"own reader: {str(e1)[:150]} | pytchat: {str(e2)[:150]}")
+
+
+def wait_until_stream_ends(video_id: str) -> None:
+    """Keep this job alive while the stream is up, so GitHub doesn't start a new run (and a new alert) every 5 min."""
+    started = time.time()
+    while time.time() - started < MAX_RUNTIME:
+        time.sleep(120)
+        vid, _ = check_live()
+        if vid != video_id:
+            return
+
+
 def sniper(video_id: str) -> None:
     url = f"https://www.youtube.com/watch?v={video_id}"
     notify(f"Tradeify is LIVE, sniper mode on: {url}")
 
-    chat = pytchat.create(video_id=video_id)
+    try:
+        reader = open_reader(video_id)
+    except Exception as e:
+        notify(f"LIVE, but I cannot read the chat automatically ({e}). Watch it yourself: {url}")
+        wait_until_stream_ends(video_id)
+        return
+
     window = deque(maxlen=WINDOW)
     last_alert = {}  # phrase -> timestamp
     started = time.time()
+    errors = 0
 
-    while chat.is_alive() and time.time() - started < MAX_RUNTIME:
+    while time.time() - started < MAX_RUNTIME:
         try:
-            for c in chat.get().sync_items():
-                text = normalize(c.message)
+            for raw in reader.read_new():
+                text = normalize(raw)
                 if len(text) >= MIN_LEN:
                     window.append(text)
-        except Exception as e:  # pytchat is unofficial; don't die on a hiccup
-            print(f"[sniper] chat error: {e}", flush=True)
+            errors = 0
+        except ChatEnded:
+            break
+        except Exception as e:
+            errors += 1
+            print(f"[sniper] chat error ({errors}): {e}", flush=True)
+            if errors >= 12:
+                notify(f"Chat reader keeps failing, giving up. Watch it yourself: {url}")
+                wait_until_stream_ends(video_id)
+                return
 
         if window:
             phrase, count = Counter(window).most_common(1)[0]
