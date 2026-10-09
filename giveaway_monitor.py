@@ -48,7 +48,8 @@ def notify(text: str) -> None:
     if not WEBHOOK:
         return
     try:
-        requests.post(WEBHOOK, json={"content": text}, timeout=10)
+        r = requests.post(WEBHOOK, json={"content": text}, timeout=10)
+        print(f"[discord] HTTP {r.status_code}", flush=True)
     except requests.RequestException as e:
         print(f"[discord] failed: {e}", flush=True)
 
@@ -263,10 +264,14 @@ def sniper(video_id: str) -> None:
     last_alert = {}  # phrase -> timestamp
     started = time.time()
     errors = 0
+    total = 0
+    last_status = 0.0
 
     while time.time() - started < MAX_RUNTIME:
         try:
-            for raw in reader.read_new():
+            batch = reader.read_new()
+            total += len(batch)
+            for raw in batch:
                 text = normalize(raw)
                 if len(text) >= MIN_LEN:
                     window.append(text)
@@ -287,6 +292,11 @@ def sniper(video_id: str) -> None:
             if count >= THRESHOLD and now - last_alert.get(phrase, 0) > COOLDOWN:
                 last_alert[phrase] = now
                 notify(f"POSSIBLE GIVEAWAY: {count} people typed \"{phrase}\"\n{url}")
+
+        if time.time() - last_status > 60:
+            last_status = time.time()
+            top = Counter(window).most_common(1)
+            print(f"[sniper] chat messages read so far: {total}, window: {len(window)}, top phrase: {top[0] if top else None}", flush=True)
 
         time.sleep(SNIPER_SECONDS)
 
